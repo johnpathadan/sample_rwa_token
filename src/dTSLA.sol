@@ -6,6 +6,7 @@ import {FunctionsClient} from "@chainlink/contracts/src/v0.8/functions/v1_0_0/Fu
 import {FunctionsRequest} from "@chainlink/contracts/src/v0.8/functions/v1_0_0/libraries/FunctionsRequest.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol"; 
 import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
 
 /*
 @title dTSLA
@@ -15,8 +16,11 @@ import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/interfaces/Ag
 
 contract dTSLA is ConfirmedOwner, FunctionsClient, ERC20 {
     using FunctionsRequest for FunctionsRequest.Request; 
+    using Strings for uint256;
 
     error dTSLA__NotEnoughCollateral();
+    error dTSLA__DoesntMeetMinimumWithdrawalAmount();
+    error dTSLA__TransferFailed();
 
     enum MintOrRedeem{
         mint,
@@ -33,23 +37,29 @@ contract dTSLA is ConfirmedOwner, FunctionsClient, ERC20 {
 
     address constant SEPOLIA_FUNCTIONS_ROUTER = 0xb83E47C2bC239B3bf370bc41e1459A34b41238D0;
     address constant SEPOLIA_TSLA_PRICE_FEED = 0xc59E3633BAAC79493d908e63626716e204A45EdF; 
+    address constant SEPOLIA_USDC_PRICE_FEED = 0xA2F78ab2355fe2f984D808B5CeE7FD0A93D5270E;
+    address constant SEPOLIA_USDC = 0xAF0d217854155ea67D583E4CB5724f7caeC3Dc87;
     uint256 constant ADDITIONAL_FEED_PRECISION = 1e10;
     bytes32 constant DON_ID = hex"66756e2d657468657265756d2d7365706f6c69612d3100000000000000000000";
     uint32 constant GAS_LIMIT = 300_000;
     uint256 constant COLLATERAL_RATIO = 200;
     uint256 constant COLLATERAL_PRECISION = 100;
+    uint256 constant MINIMUM_WITHDRAWAL_AMOUNT = 100e18; 
 
     uint64 immutable i_subId;
 
     string private s_mintSourceCode;
+    string private s_redeemSourceCode;
     uint256 private s_portfolioBalance;
     mapping(bytes32 requestId => dTslaRequest request) private s_requestIdToRequest;
+    mapping(address user => uint256 pendingWithdrawalAmount) private s_userToWithdrawalAmount;
 
-    constructor(string memory mintSourceCode, uint64 subId) ConfirmedOwner(msg.sender)
+    constructor(string memory mintSourceCode, uint64 subId, string memory redeemSourceCode) ConfirmedOwner(msg.sender)
      FunctionsClient(SEPOLIA_FUNCTIONS_ROUTER)
      ERC20("dTSLA", "dTSLA")
      {
         s_mintSourceCode = mintSourceCode;
+        s_redeemSourceCode = redeemSourceCode;
         i_subId = subId;
     }
 
@@ -78,14 +88,54 @@ contract dTSLA is ConfirmedOwner, FunctionsClient, ERC20 {
             revert dTSLA__NotEnoughCollateral();
         } 
 
-        if(amountOfTokensToMint > 0){
+        if(amountOfTokensToMint != 0){
             _mint(s_requestIdToRequest[requestId].requester, amountOfTokensToMint);
         }
     }
 
-    function sendRedeemRequest() external {}
+    function sendRedeemRequest(uint256 amountOfDtsla) external {
+        uint256 amountOfTslaInUsdc = getUsdcValueOfUsd(getUsdValueOfTsla(amountOfDtsla));
+        if(amountOfTslaInUsdc < MINIMUM_WITHDRAWAL_AMOUNT){
+            revert dTSLA__DoesntMeetMinimumWithdrawalAmount();
+        }
 
-    function _redeemFulfillRequest(bytes32 requestId, bytes memory response) internal {}
+        FunctionsRequest.Request memory req; 
+        req.initializeRequestForInlineJavaScript(s_redeemSourceCode); 
+
+        string[] memory args = new string[](2);
+        args[0] = amountOfDtsla.toString();
+        args[1] = amountOfTslaInUsdc.toString();
+        req.setArgs(args);
+
+        bytes32 requestId = _sendRequest(req.encodeCBOR(), i_subId, GAS_LIMIT, DON_ID); 
+        s_requestIdToRequest[requestId] = dTslaRequest(
+             amountOfDtsla,
+             msg.sender,
+            MintOrRedeem.redeem
+        );
+
+        _burn(msg.sender, amountOfDtsla);
+    }
+
+    function _redeemFulfillRequest(bytes32 requestId, bytes memory response) internal {
+        if(usdcAmount == 0){
+            uint256 amountOfDtslaBurned = s_requestIdToRequest[requestId].amountOfToken;
+            _mint(s_requestIdToRequest[requestId].requester, amountOfDtslaBurned);
+            return;
+        }
+        s_userToWithdrawalAmount[s_requestIdToRequest[requestId].requester] += usdcAmount;
+    }
+
+    function withdraw() external {
+        uint256 amountToWithdraw = s_userToWithdrawalAmount[msg.sender];
+        s_userToWithdrawalAmount[msg.sender] = 0;
+        bool success = ERC20(0xAF0d217854155ea67D583E4CB5724f7caeC3Dc87).transfer(msg.sender, amountToWithdraw);
+        if(!success){
+            revert(dTSLA__TransferFailed());
+        }
+    }
+
+
 
     function fulfillRequest(bytes32 requestId, bytes memory response, bytes memory /* err*/) internal override {
         if(s_requestIdToRequest[requestId].mintOrRedeem == MintOrRedeem.mint){
@@ -104,10 +154,56 @@ contract dTSLA is ConfirmedOwner, FunctionsClient, ERC20 {
         return ((totalSupply() + addedNumberOfTokens) *getTslaPrice())/ PRECISION;
     }
 
-    function getTslaPrice(){
+    function getUsdcValueOfUsd(uint256 usdAmount) public view returns(uint256){
+        return(usdAmount * getUsdcPrice())/ PRECISION;
+    }
+
+    function getUsdValueOfTsla(uint256 tslaAmount) public view returns(uint256){
+        return (tslaAmount * getTslaPrice())/ PRECISION;
+    }
+
+    function getTslaPrice() public view returns(uint256){
         AggregatorV3Interface priceFeed = AggregatorV3Interface(SEPOLIA_TSLA_PRICE_FEED);
         (,int256 price,,,) = priceFeed.latestRoundData();
         return uint256(price) * ADDITIONAL_FEED_PRECISION;
     }
-    
+
+    function getUsdcPrice() public view returns(uint256){
+        AggregatorV3Interface priceFeed = AggregatorV3Interface(SEPOLIA_USDC_PRICE_FEED);
+        (,int256 price,,,) = priceFeed.latestRoundData();
+        return uint256(price) * ADDITIONAL_FEED_PRECISION;
+    }
+
+    //getters
+    function getRequest(bytes32 requestId) external view returns(dTslaRequest memory){
+        return s_requestIdToRequest[requestId];
+    }
+
+    function getPendingWithdrawalAmount(address user) external view returns(uint256){
+        return s_userToWithdrawalAmount[user];
+    }
+
+     function getPortfolioBalance() public view returns(uint256){
+        return s_portfolioBalance;
+    }
+
+     function getMintSourceCode() external view returns(string memory){
+        return s_mintSourceCode;
+    }
+
+    function getSubId() external view returns(uint64){
+        return i_subId;
+    }
+
+     function getRedeemSourceCode() external view returns(string memory){
+        return s_redeemSourceCode;
+    }
+
+    function getCollateralRatio() public view returns(uint256){
+        return COLLATERAL_RATIO;
+    }
+
+    function getCollateralPrecision() public view returns(uint256){
+        return COLLATERAL_PRECISION;
+    }
 }
