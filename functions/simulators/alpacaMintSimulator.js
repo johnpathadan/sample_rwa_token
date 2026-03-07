@@ -2,9 +2,6 @@ require("dotenv").config({ path: "../../.env" });
 const requestConfig = require("../configs/alpacaMintConfig.js")
 const { simulateScript, decodeResult } = require("@chainlink/functions-toolkit")
 
-//this is what we will use to test sending this request to
-// check what will happen on the chainlink nodes
-
 async function main() {
   const { responseBytesHexstring, errorString, } =
     await simulateScript(requestConfig)

@@ -10,7 +10,6 @@ const requestConfig = {
     alpacaSecret: process.env.ALPACA_SECRET_KEY
   },
   secretsLocation: Location.DONHosted,
-  //^ where we are going to upload our secrets to DON
   args: [],
   codeLanguage: CodeLanguage.JavaScript,
   expectedReturnType: ReturnType.uint256
